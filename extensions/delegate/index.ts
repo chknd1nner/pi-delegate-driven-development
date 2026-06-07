@@ -1,0 +1,592 @@
+import { execSync } from "node:child_process";
+import { rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { Type } from "typebox";
+import { StringEnum } from "@earendil-works/pi-ai";
+import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { RPCClient } from "./rpc-client";
+import { ProgressAccumulator } from "./progress";
+import { buildSessionSnapshot } from "./snapshot";
+import { ProgressLogWriter, StatusFileWriter } from "./visibility";
+import { WorkerManager } from "./worker-manager";
+import type { DelegateStartParams, WorkerStatus } from "./types";
+
+function resolveGitRoot(cwd: string): string {
+  try {
+    return execSync("git rev-parse --show-toplevel", { cwd, encoding: "utf8", timeout: 5000 }).trim();
+  } catch {
+    return cwd;
+  }
+}
+
+function todayDate(): string {
+  return new Date().toLocaleDateString("en-CA");
+}
+
+function statusFromAgentEndMessages(messages: unknown[] | undefined): WorkerStatus {
+  if (!Array.isArray(messages)) return "completed";
+
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const message = messages[i] as { role?: string; stopReason?: string };
+    if (message.role !== "assistant") continue;
+    if (message.stopReason === "aborted") return "aborted";
+    if (message.stopReason === "error") return "failed";
+    return "completed";
+  }
+
+  return "completed";
+}
+
+const DELEGATE_TOOLS = ["delegate_start", "delegate_check", "delegate_steer", "delegate_abort", "delegate_result", "delegate_anchor"];
+
+export default function delegate(pi: ExtensionAPI) {
+  const initialCwd = process.cwd();
+  const projectRoot = resolveGitRoot(initialCwd);
+
+  // Session ID is resolved from ctx.sessionManager inside event handlers.
+  // Cached here and updated on each session_start event.
+  let sessionId = `run-${Date.now().toString(36)}`;
+
+  pi.on("session_start", async (_event, ctx) => {
+    try {
+      const id = ctx.sessionManager.getSessionId?.();
+      if (id) sessionId = id;
+    } catch {
+      // keep fallback run-id
+    }
+  });
+
+  const manager = new WorkerManager({
+    maxWorkers: 2,
+    projectRoot,
+    maxWorkersEnv: process.env.DELEGATE_MAX_WORKERS,
+  });
+  const anchorMap = new Map<string, string | null>();
+
+  pi.registerTool({
+    name: "delegate_start",
+    label: "Delegate Start",
+    description: "Spawn a worker agent as an isolated Pi RPC subprocess to execute a task.",
+    promptSnippet: "Spawn a worker agent to execute a task in an isolated subprocess.",
+    promptGuidelines: [
+      "Use delegate_start to offload tasks to a worker agent (code review, implementation, research).",
+      "The worker runs as a separate Pi process with its own context window.",
+      "Check progress with delegate_check, steer with delegate_steer, abort with delegate_abort, read result with delegate_result.",
+      "Maximum 2 concurrent workers by default.",
+    ],
+    parameters: Type.Object({
+      task: Type.String({ description: "Prompt/instructions for the worker" }),
+      model: Type.String({ description: 'Model ID, e.g. "claude-sonnet-4-6"' }),
+      provider: Type.String({ description: 'Provider ID, e.g. "anthropic", "github-copilot"' }),
+      thinking: Type.Optional(
+        StringEnum(["off", "minimal", "low", "medium", "high", "xhigh"] as const, {
+          description: "Thinking level for the worker",
+        }),
+      ),
+      tools: Type.Optional(
+        Type.Array(Type.String(), { description: "Tool allowlist — only these tools enabled. Mutually exclusive with denied_tools." }),
+      ),
+      denied_tools: Type.Optional(
+        Type.Array(Type.String(), { description: "Tool deny list — all tools except these. Mutually exclusive with tools. delegate_* tools are always denied." }),
+      ),
+      timeout: Type.Optional(
+        Type.Number({ description: "Timeout in seconds (default 1800)", default: 1800 }),
+      ),
+      visibility: Type.Optional(
+        StringEnum(["log"] as const, { description: 'Visibility mode (currently only "log")' }),
+      ),
+      system_prompt: Type.Optional(
+        Type.String({ description: "Additional system prompt appended to worker" }),
+      ),
+      cwd: Type.Optional(
+        Type.String({ description: "Working directory for the worker (default: project root)" }),
+      ),
+      inherit_context: Type.Optional(
+        Type.Union([Type.Boolean(), Type.String({ minLength: 1 })], {
+          description:
+            'false/absent = ephemeral (--no-session). true = inherit current session context. "name" = inherit from named anchor set by delegate_anchor.',
+        }),
+      ),
+    }),
+
+    async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+      if (params.tools && params.denied_tools) {
+        throw new Error(
+          "Cannot specify both 'tools' (allowlist) and 'denied_tools' (denylist). Pick one.",
+        );
+      }
+
+      if (!manager.canStart()) {
+        const active = manager.activeWorkerDescriptions();
+        const desc = active.map((w) => `  ${w.taskId}: ${w.task.slice(0, 80)}`).join("\n");
+        throw new Error(
+          `Cannot start: ${active.length} workers already running.\n\nActive workers:\n${desc}\n\nAbort one with delegate_abort before starting a new task.`,
+        );
+      }
+
+      const taskId = manager.nextTaskId();
+      const workerCwd = params.cwd ?? projectRoot;
+      const timeout = params.timeout ?? 1800;
+
+      // Resolve tool allowlist: always exclude delegate_* tools to prevent recursive delegation.
+      let toolsAllowlist: string[] | undefined = params.tools;
+      if (toolsAllowlist) {
+        toolsAllowlist = toolsAllowlist.filter((t) => !DELEGATE_TOOLS.includes(t));
+      }
+
+      // For denied_tools mode, we need the full list of available tool names.
+      const allToolNames = pi.getAllTools().map((t) => t.name);
+      const deniedTools = params.denied_tools
+        ? [...new Set([...params.denied_tools, ...DELEGATE_TOOLS])]
+        : DELEGATE_TOOLS;
+
+      const entry = manager.register(taskId, params as DelegateStartParams);
+
+      const progress = new ProgressAccumulator();
+      entry.progress = progress;
+
+      const artifactDate = todayDate();
+      const logWriter = new ProgressLogWriter(projectRoot, artifactDate, sessionId, taskId);
+      entry.logWriter = logWriter;
+
+      const statusWriter = new StatusFileWriter(projectRoot, artifactDate, sessionId, taskId);
+      entry.statusWriter = statusWriter;
+
+      let logWriterFailed = false;
+      const tryAppendText = (text: string) => {
+        if (logWriterFailed) return;
+        try {
+          logWriter.appendText(text);
+        } catch {
+          logWriterFailed = true;
+        }
+      };
+      const tryAppendToolCall = (toolName: string, args: string) => {
+        if (logWriterFailed) return;
+        try {
+          logWriter.appendToolCall(toolName, args);
+        } catch {
+          logWriterFailed = true;
+        }
+      };
+      const tryCloseLogWriter = () => {
+        try {
+          logWriter.close();
+        } catch {
+          // ignore close errors
+        }
+      };
+
+      const tryCleanupTempFile = () => {
+        if (!entry.tempFilePath) return;
+        try {
+          rmSync(entry.tempFilePath, { force: true });
+        } catch {
+          // ignore
+        }
+      };
+
+      const transitionWorker = (status: WorkerStatus, error?: string): boolean => {
+        const applied = manager.setStatus(taskId, status, error);
+        if (applied) {
+          statusWriter.writeStatus(status);
+        }
+        return applied;
+      };
+
+      let sessionPath: string | undefined;
+
+      if (params.inherit_context === true || typeof params.inherit_context === "string") {
+        let tmpPath: string | undefined;
+
+        try {
+          const sessionManager = (
+            ctx as {
+              sessionManager: {
+                getLeafId(): string | null;
+                getBranch(fromId?: string): object[];
+              };
+            }
+          ).sessionManager;
+
+          let anchorEntryId: string | null;
+
+          if (params.inherit_context === true) {
+            anchorEntryId = sessionManager.getLeafId();
+          } else {
+            const anchorName = params.inherit_context as string;
+            if (!anchorMap.has(anchorName)) {
+              throw new Error(
+                `No anchor named '${anchorName}'. Call delegate_anchor({ name: '${anchorName}' }) first.`,
+              );
+            }
+            anchorEntryId = anchorMap.get(anchorName)!;
+          }
+
+          tmpPath = `${tmpdir()}/pi-worker-${taskId}-${Date.now()}.jsonl`;
+          const snapshot = buildSessionSnapshot(sessionManager, workerCwd, anchorEntryId);
+          writeFileSync(tmpPath, snapshot, "utf8");
+          entry.tempFilePath = tmpPath;
+          sessionPath = tmpPath;
+        } catch (err) {
+          if (tmpPath) {
+            try {
+              rmSync(tmpPath, { force: true });
+            } catch {
+              // ignore
+            }
+          }
+          const msg = err instanceof Error ? err.message : String(err);
+          transitionWorker("failed", msg);
+          tryCloseLogWriter();
+          throw new Error(msg);
+        }
+      }
+
+      const rpcClient = new RPCClient(
+        {
+          model: params.model,
+          provider: params.provider,
+          thinking: params.thinking,
+          tools: toolsAllowlist,
+          deniedTools: toolsAllowlist ? undefined : deniedTools,
+          allToolNames: toolsAllowlist ? undefined : allToolNames,
+          systemPrompt: params.system_prompt,
+          cwd: workerCwd,
+          sessionPath,
+        },
+        {
+          onEvent(event) {
+            progress.handleEvent(event);
+
+            if (event.type === "message_update") {
+              const ame = event.assistantMessageEvent as { type: string; delta?: string } | undefined;
+              if (ame?.type === "text_delta" && ame.delta) {
+                tryAppendText(ame.delta);
+              }
+            } else if (event.type === "tool_execution_start") {
+              const args = JSON.stringify(event.args ?? {}).slice(0, 80);
+              tryAppendToolCall(event.toolName as string, args);
+            }
+
+            if (event.type === "agent_end") {
+              const nextStatus = statusFromAgentEndMessages((event as { messages?: unknown[] }).messages);
+              transitionWorker(nextStatus);
+              rpcClient.closeStdin();
+              tryCloseLogWriter();
+              if (entry.timeoutTimer) clearTimeout(entry.timeoutTimer);
+            }
+          },
+          onExit(code, _signal) {
+            tryCleanupTempFile();
+            transitionWorker("failed", `Process exited unexpectedly (code ${code})`);
+            tryCloseLogWriter();
+            if (entry.timeoutTimer) clearTimeout(entry.timeoutTimer);
+          },
+          onError(err) {
+            tryCleanupTempFile();
+            transitionWorker("failed", err);
+            tryCloseLogWriter();
+            if (entry.timeoutTimer) clearTimeout(entry.timeoutTimer);
+          },
+        },
+      );
+
+      entry.rpcClient = rpcClient;
+
+      try {
+        statusWriter.writeStatus("running");
+        rpcClient.start();
+        rpcClient.send({ type: "prompt", message: params.task });
+      } catch (err) {
+        tryCleanupTempFile();
+        const message = err instanceof Error ? err.message : String(err);
+        transitionWorker("failed", message);
+        tryCloseLogWriter();
+        throw new Error(`Failed to start worker ${taskId}: ${message}`);
+      }
+
+      entry.timeoutTimer = setTimeout(async () => {
+        const applied = transitionWorker("aborted", `Timed out after ${timeout}s`);
+        if (applied) {
+          await rpcClient.kill();
+        }
+        tryCloseLogWriter();
+      }, timeout * 1000);
+
+      return {
+        content: [{ type: "text" as const, text: `Worker ${taskId} started. Use delegate_check("${taskId}") to monitor progress.` }],
+        details: {
+          task_id: taskId,
+          status: "running",
+          progress_file: logWriter.getFilePath(),
+          status_file: statusWriter.getFilePath(),
+        },
+      };
+    },
+  });
+
+  pi.registerTool({
+    name: "delegate_anchor",
+    label: "Delegate Anchor",
+    description: "Save a named session anchor for later context inheritance.",
+    parameters: Type.Object({
+      name: Type.Optional(Type.String({ description: 'Anchor name (default: "default")' })),
+      entry_id: Type.Optional(Type.String({ description: "Optional entry ID on the current branch" })),
+    }),
+
+    async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+      const name = params.name ?? "default";
+      const sessionManager = ctx.sessionManager as {
+        getLeafId(): string | null;
+        getBranch(entryId?: string): Array<{ id: string }>;
+      };
+
+      let entryId: string | null;
+      if (params.entry_id !== undefined) {
+        const currentBranch = sessionManager.getBranch();
+        const inCurrentBranch = currentBranch.some((entry) => entry.id === params.entry_id);
+        if (!inCurrentBranch) {
+          throw new Error(`Entry '${params.entry_id}' not found on current branch`);
+        }
+        entryId = params.entry_id;
+      } else {
+        entryId = sessionManager.getLeafId();
+      }
+
+      anchorMap.set(name, entryId);
+
+      const entryCount = entryId === null ? 0 : sessionManager.getBranch(entryId).length;
+
+      return {
+        content: [
+          {
+            type: "text" as const,
+            text: `Anchor '${name}' saved (${entryCount} entries).`,
+          },
+        ],
+        details: { name, entryId, entryCount },
+      };
+    },
+  });
+
+  pi.registerTool({
+    name: "delegate_check",
+    label: "Delegate Check",
+    description: "Query the progress of a running or completed worker.",
+    parameters: Type.Object({
+      task_id: Type.String({ description: "Worker task ID" }),
+      detail: Type.Optional(
+        StringEnum(["summary", "full"] as const, { description: "Level of detail (default: summary)" }),
+      ),
+    }),
+
+    async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+      const entry = manager.get(params.task_id);
+      if (!entry) {
+        throw new Error(`Unknown task ID: ${params.task_id}`);
+      }
+
+      const progressSummary = entry.progress!.getSummary();
+      const usage = entry.progress!.getUsage();
+      const elapsed = Math.round((Date.now() - entry.startedAt) / 1000);
+
+      let contextPercent: number | null = null;
+      if (usage.lastAssistantInput !== null) {
+        const model = ctx.modelRegistry?.find(entry.params.provider, entry.params.model);
+        const window = model?.contextWindow;
+        if (typeof window === "number" && window > 0) {
+          contextPercent = Math.round((100 * usage.lastAssistantInput) / window);
+        }
+      }
+
+      const summary: Record<string, unknown> = {
+        status: entry.status,
+        elapsed_seconds: elapsed,
+        tool_calls: progressSummary.tool_calls,
+        last_activity_seconds_ago: progressSummary.last_activity_seconds_ago,
+        recent_activity: progressSummary.recent_activity,
+        input_tokens: usage.input,
+        output_tokens: usage.output,
+        context_usage_percent: contextPercent,
+      };
+
+      if (entry.error) {
+        summary.error = entry.error;
+      }
+
+      let text = Object.entries(summary)
+        .map(([k, v]) => {
+          if (Array.isArray(v)) return `${k}:\n${v.map((item) => `  - ${item}`).join("\n")}`;
+          return `${k}: ${v}`;
+        })
+        .join("\n");
+
+      if (params.detail === "full") {
+        text += `\n\ntranscript:\n${progressSummary.transcript}`;
+      }
+
+      return {
+        content: [{ type: "text" as const, text }],
+        details: summary,
+      };
+    },
+  });
+
+  pi.registerTool({
+    name: "delegate_steer",
+    label: "Delegate Steer",
+    description: "Send a steering message to a running worker. Delivered between turns.",
+    parameters: Type.Object({
+      task_id: Type.String({ description: "Worker task ID" }),
+      message: Type.String({ description: "Steering instruction" }),
+    }),
+
+    async execute(_toolCallId, params, _signal, _onUpdate, _ctx) {
+      const entry = manager.get(params.task_id);
+      if (!entry) {
+        throw new Error(`Unknown task ID: ${params.task_id}`);
+      }
+
+      if (entry.status !== "running") {
+        throw new Error(
+          `Cannot steer ${params.task_id}: worker is ${entry.status}, not running.`,
+        );
+      }
+
+      if (!entry.rpcClient?.isAlive()) {
+        throw new Error(
+          `Cannot steer ${params.task_id}: worker process is not alive.`,
+        );
+      }
+
+      // steer requires active streaming. During compaction the RPC layer may reject it.
+      const resp = await entry.rpcClient.sendAndWait({ type: "steer", message: params.message });
+      const respObj = resp as { success?: boolean; error?: string } | null | undefined;
+      if (respObj && respObj.success === false) {
+        const reason = respObj.error ?? "worker not actively streaming (possibly mid-compaction)";
+        throw new Error(
+          `Steer rejected by ${params.task_id}: ${reason}. Retry shortly.`,
+        );
+      }
+
+      return {
+        content: [{ type: "text" as const, text: `Steering message sent to ${params.task_id}.` }],
+        details: { success: true },
+      };
+    },
+  });
+
+  pi.registerTool({
+    name: "delegate_abort",
+    label: "Delegate Abort",
+    description: "Terminate a running worker. Sends RPC abort for clean shutdown, falls back to SIGTERM/SIGKILL.",
+    parameters: Type.Object({
+      task_id: Type.String({ description: "Worker task ID" }),
+    }),
+
+    async execute(_toolCallId, params, _signal, _onUpdate, _ctx) {
+      const entry = manager.get(params.task_id);
+      if (!entry) {
+        throw new Error(`Unknown task ID: ${params.task_id}`);
+      }
+
+      const applied = manager.setStatus(params.task_id, "aborted", "Aborted by orchestrator");
+      if (!applied) {
+        return {
+          content: [{ type: "text" as const, text: `Worker ${params.task_id} is already ${entry.status}.` }],
+          details: { success: false },
+        };
+      }
+
+      entry.statusWriter?.writeStatus("aborted");
+      if (entry.timeoutTimer) clearTimeout(entry.timeoutTimer);
+
+      if (entry.rpcClient) {
+        await entry.rpcClient.kill();
+      }
+      entry.logWriter?.close();
+
+      return {
+        content: [{ type: "text" as const, text: `Worker ${params.task_id} aborted.` }],
+        details: { success: true },
+      };
+    },
+  });
+
+  pi.registerTool({
+    name: "delegate_result",
+    label: "Delegate Result",
+    description: "Read the final output of a completed worker.",
+    parameters: Type.Object({
+      task_id: Type.String({ description: "Worker task ID" }),
+    }),
+
+    async execute(_toolCallId, params, _signal, _onUpdate, _ctx) {
+      const entry = manager.get(params.task_id);
+      if (!entry) {
+        throw new Error(`Unknown task ID: ${params.task_id}`);
+      }
+
+      if (entry.status === "running") {
+        throw new Error(
+          `Worker ${params.task_id} is still running. Use delegate_check to monitor progress, or delegate_abort to stop it.`,
+        );
+      }
+
+      const transcript = entry.progress?.getFullTranscript() ?? "";
+      const finalMessages = entry.progress?.getFinalMessages() ?? [];
+      const usage = entry.progress?.getUsage?.() ?? {
+        input: 0,
+        output: 0,
+        cacheRead: 0,
+        cacheWrite: 0,
+        lastAssistantInput: null,
+      };
+
+      // AssistantMessage.content is (TextContent | ThinkingContent | ToolCall)[], not a string.
+      let resultText = "";
+      for (const msg of finalMessages) {
+        const m = msg as { role?: string; content?: unknown[] };
+        if (m.role === "assistant" && Array.isArray(m.content)) {
+          for (const block of m.content) {
+            if ((block as { type: string }).type === "text") {
+              resultText += (block as { text: string }).text;
+            }
+          }
+        }
+      }
+
+      if (!resultText) {
+        resultText = transcript;
+      }
+
+      const result: Record<string, unknown> = {
+        status: entry.status,
+        result: resultText.trim(),
+        usage: {
+          input: usage.input,
+          output: usage.output,
+          cacheRead: usage.cacheRead,
+          cacheWrite: usage.cacheWrite,
+        },
+      };
+
+      if (entry.error) {
+        result.error = entry.error;
+        if (entry.rpcClient) {
+          result.stderr = entry.rpcClient.getStderr().slice(-2000);
+        }
+      }
+
+      return {
+        content: [{ type: "text" as const, text: resultText.trim() || `Worker ${params.task_id} ${entry.status} with no output.${entry.error ? ` Error: ${entry.error}` : ""}` }],
+        details: result,
+      };
+    },
+  });
+
+  pi.on("session_shutdown", async () => {
+    await manager.disposeAll();
+  });
+}

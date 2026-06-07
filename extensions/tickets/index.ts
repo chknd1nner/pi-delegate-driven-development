@@ -1,0 +1,651 @@
+/**
+ * Ticket Management Extension for π
+ *
+ * Provides tools for sharding implementation plans into tickets
+ * and managing ticket workflow operations.
+ */
+import { execSync, spawnSync } from "node:child_process";
+import { existsSync, readdirSync, readFileSync, mkdirSync, renameSync, writeFileSync } from "node:fs";
+import { join, basename, dirname } from "node:path";
+import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { Type } from "typebox";
+
+// --- Configuration ---
+const TICKETS_DIR = "in-progress";
+const STATUSES = ["ready", "active", "review", "needs-fix", "blocked", "done"] as const;
+type Status = (typeof STATUSES)[number];
+
+// --- Helper Functions ---
+
+function mdedit(args: string[], cwd: string): string {
+  const result = spawnSync("mdedit", args, { cwd, encoding: "utf-8" });
+  if (result.error) throw new Error(`mdedit error: ${result.error.message}`);
+  return result.stdout || "";
+}
+
+export function findTicket(pattern: string, cwd: string): string | null {
+  const ticketsDir = join(cwd, TICKETS_DIR);
+  const matches: string[] = [];
+
+  for (const status of STATUSES) {
+    const statusDir = join(ticketsDir, status);
+    if (!existsSync(statusDir)) continue;
+
+    const files = readdirSync(statusDir).filter((f) => f.endsWith(".md") && f.includes(pattern));
+    for (const file of files) {
+      matches.push(join(statusDir, file));
+    }
+  }
+
+  if (matches.length === 0) return null;
+  if (matches.length > 1) {
+    throw new Error(`Multiple tickets match '${pattern}':\n  ${matches.join("\n  ")}`);
+  }
+  return matches[0];
+}
+
+function getStatusFromPath(filepath: string): Status | null {
+  for (const status of STATUSES) {
+    if (filepath.includes(`/${status}/`)) return status;
+  }
+  return null;
+}
+
+function ensureStatusDir(status: Status, cwd: string): string {
+  const dir = join(cwd, TICKETS_DIR, status);
+  if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
+  return dir;
+}
+
+function listTicketsInStatus(status: Status, cwd: string): Array<{ file: string; title: string }> {
+  const statusDir = join(cwd, TICKETS_DIR, status);
+  if (!existsSync(statusDir)) return [];
+
+  const files = readdirSync(statusDir)
+    .filter((f) => f.endsWith(".md"))
+    .sort();
+
+  return files.map((file) => {
+    const filepath = join(statusDir, file);
+    let title = "(no title)";
+    try {
+      const output = mdedit(["frontmatter", "get", filepath, "title"], cwd);
+      const match = output.match(/title:\s*"?(.+?)"?\s*$/m);
+      if (match) title = match[1];
+    } catch {
+      // ignore
+    }
+    return { file: basename(file, ".md"), title };
+  });
+}
+
+// --- Tool Implementations ---
+
+interface ShardResult {
+  ticketsCreated: number;
+  tickets: Array<{ number: number; title: string; filename: string }>;
+  outputDir: string;
+}
+
+export function shardPlan(planPath: string, specPath: string | undefined, cwd: string): ShardResult {
+  const fullPlanPath = join(cwd, planPath);
+  if (!existsSync(fullPlanPath)) {
+    throw new Error(`Plan file not found: ${planPath}`);
+  }
+
+  // Get outline to find task sections
+  const outline = mdedit(["outline", fullPlanPath], cwd);
+  const taskLines = outline.split("\n").filter((line) => /###\s+Task\s+\d+:/.test(line));
+
+  if (taskLines.length === 0) {
+    throw new Error("No '### Task N:' sections found in plan");
+  }
+
+  const readyDir = ensureStatusDir("ready", cwd);
+  const tickets: ShardResult["tickets"] = [];
+
+  for (const taskLine of taskLines) {
+    // Parse: "    ### Task 7: Title here — 944 words (lines 2348–2667)"
+    const headingMatch = taskLine.match(/###\s+(Task\s+\d+:\s*.+?)\s+—\s+\d+\s+words/);
+    if (!headingMatch) continue;
+
+    const heading = headingMatch[1];
+    const numMatch = heading.match(/^Task\s+(\d+):/);
+    if (!numMatch) continue;
+
+    const taskNum = parseInt(numMatch[1], 10);
+    const title = heading.replace(/^Task\s+\d+:\s*/, "").trim();
+    const taskNumPadded = taskNum.toString().padStart(2, "0");
+
+    // Create slug from title
+    const slug = title
+      .toLowerCase()
+      .replace(/[^a-z0-9]+/g, "-")
+      .replace(/^-+|-+$/g, "");
+
+    const filename = `task-${taskNumPadded}-${slug}.md`;
+    const filepath = join(readyDir, filename);
+
+    // Extract task content using mdedit or fallback to sed
+    let taskContent = "";
+    try {
+      const extracted = mdedit(["extract", fullPlanPath, heading], cwd);
+      const lines = extracted.split("\n");
+      taskContent = lines[0]?.startsWith("SECTION:") ? lines.slice(1).join("\n") : extracted;
+    } catch {
+      // mdedit may fail on headings with special chars - use line numbers
+    }
+
+    // Fallback: extract using line numbers from outline
+    if (!taskContent.trim()) {
+      const lineMatch = taskLine.match(/lines\s+(\d+)[–-](\d+)/);
+      if (lineMatch) {
+        const startLine = parseInt(lineMatch[1], 10) + 1;
+        const endLine = parseInt(lineMatch[2], 10);
+        const result = spawnSync("sed", ["-n", `${startLine},${endLine}p`, fullPlanPath], {
+          cwd,
+          encoding: "utf-8",
+        });
+        taskContent = result.stdout || "";
+      }
+    }
+
+    if (!taskContent.trim()) {
+      continue; // Skip if we couldn't extract content
+    }
+
+    // Build frontmatter (data only — worker prompts live in the skill, not the ticket)
+    const specField = specPath ? `spec_path: ${specPath}\n` : "";
+
+    const content = `---
+task_number: ${taskNum}
+title: "${title}"
+status: ready
+plan_path: ${planPath}
+${specField}next_prompt: ""
+review_failures: 0
+task_base_sha: ""
+---
+
+# Task ${taskNumPadded} — ${title}
+
+## Plan excerpt
+
+${taskContent}
+
+---
+
+## Notes
+
+<!-- Optional, human-facing. Durable loop state lives in frontmatter / next_prompt. -->
+`;
+
+    writeFileSync(filepath, content);
+    tickets.push({ number: taskNum, title, filename });
+  }
+
+  return {
+    ticketsCreated: tickets.length,
+    tickets,
+    outputDir: `${TICKETS_DIR}/ready`,
+  };
+}
+
+interface ListResult {
+  statuses: Array<{
+    status: Status;
+    count: number;
+    tickets: Array<{ file: string; title: string }>;
+  }>;
+}
+
+function listTickets(filterStatus: Status | undefined, cwd: string): ListResult {
+  const statuses = filterStatus ? [filterStatus] : STATUSES;
+  const result: ListResult = { statuses: [] };
+
+  for (const status of statuses) {
+    const tickets = listTicketsInStatus(status as Status, cwd);
+    result.statuses.push({
+      status: status as Status,
+      count: tickets.length,
+      tickets,
+    });
+  }
+
+  return result;
+}
+
+interface ShowResult {
+  file: string;
+  frontmatter: Record<string, unknown>;
+  outline: string;
+}
+
+function showTicket(pattern: string, cwd: string): ShowResult {
+  const filepath = findTicket(pattern, cwd);
+  if (!filepath) throw new Error(`No ticket found matching '${pattern}'`);
+
+  // Get frontmatter
+  const fmOutput = mdedit(["frontmatter", "show", filepath], cwd);
+  const frontmatter: Record<string, unknown> = {};
+
+  // Parse frontmatter output (simple key: value parsing)
+  const fmLines = fmOutput.split("\n");
+  let currentKey = "";
+  let currentValue = "";
+
+  for (const line of fmLines) {
+    const keyMatch = line.match(/^\s{2}(\w+):\s*(.*)$/);
+    if (keyMatch) {
+      if (currentKey) {
+        frontmatter[currentKey] = currentValue.trim();
+      }
+      currentKey = keyMatch[1];
+      currentValue = keyMatch[2];
+    } else if (currentKey && line.startsWith("  ")) {
+      currentValue += "\n" + line.trim();
+    }
+  }
+  if (currentKey) {
+    frontmatter[currentKey] = currentValue.trim();
+  }
+
+  // Get outline
+  const outline = mdedit(["outline", filepath], cwd);
+
+  return {
+    file: basename(filepath),
+    frontmatter,
+    outline,
+  };
+}
+
+interface MoveResult {
+  file: string;
+  fromStatus: Status;
+  toStatus: Status;
+  newPath: string;
+}
+
+function moveTicket(pattern: string, targetStatus: Status, cwd: string): MoveResult {
+  if (!STATUSES.includes(targetStatus)) {
+    throw new Error(`Invalid status '${targetStatus}'. Valid statuses: ${STATUSES.join(", ")}`);
+  }
+
+  const filepath = findTicket(pattern, cwd);
+  if (!filepath) throw new Error(`No ticket found matching '${pattern}'`);
+
+  const fromStatus = getStatusFromPath(filepath);
+  if (!fromStatus) throw new Error(`Could not determine current status for ${filepath}`);
+
+  // Update frontmatter
+  mdedit(["frontmatter", "set", filepath, "status", targetStatus], cwd);
+
+  // Move file to matching folder
+  const targetDir = ensureStatusDir(targetStatus, cwd);
+  const filename = basename(filepath);
+  const newPath = join(targetDir, filename);
+
+  if (filepath !== newPath) {
+    renameSync(filepath, newPath);
+  }
+
+  return {
+    file: filename,
+    fromStatus,
+    toStatus: targetStatus,
+    newPath: join(TICKETS_DIR, targetStatus, filename),
+  };
+}
+
+interface SetResult {
+  file: string;
+  field: string;
+  value: string;
+}
+
+export function setTicketField(pattern: string, field: string, value: string, cwd: string): SetResult {
+  const filepath = findTicket(pattern, cwd);
+  if (!filepath) throw new Error(`No ticket found matching '${pattern}'`);
+
+  mdedit(["frontmatter", "set", filepath, field, value], cwd);
+
+  return {
+    file: basename(filepath),
+    field,
+    value,
+  };
+}
+
+interface NextPromptResult {
+  file: string;
+  next_prompt: string;
+}
+
+interface GetFieldResult {
+  file: string;
+  field: string;
+  value: string;
+}
+
+export function getTicketField(pattern: string, field: string, cwd: string): GetFieldResult {
+  const filepath = findTicket(pattern, cwd);
+  if (!filepath) throw new Error(`No ticket found matching '${pattern}'`);
+
+  // mdedit prints the raw field value (no "field:" prefix). Empty value -> "".
+  const output = mdedit(["frontmatter", "get", filepath, field], cwd);
+  return {
+    file: basename(filepath),
+    field,
+    value: output.replace(/\n+$/, ""),
+  };
+}
+
+export function getNextPrompt(pattern: string, cwd: string): NextPromptResult {
+  const filepath = findTicket(pattern, cwd);
+  if (!filepath) throw new Error(`No ticket found matching '${pattern}'`);
+
+  const output = mdedit(["frontmatter", "get", filepath, "next_prompt"], cwd);
+  // Skip the "next_prompt:" header line
+  const lines = output.split("\n");
+  const promptLines = lines.slice(1);
+
+  return {
+    file: basename(filepath),
+    next_prompt: promptLines.join("\n").trim(),
+  };
+}
+
+// --- Extension Export ---
+
+export default function ticketsExtension(pi: ExtensionAPI) {
+  // Tool: ticket_shard
+  pi.registerTool({
+    name: "ticket_shard",
+    label: "Shard Plan",
+    description:
+      "Shard an implementation plan into individual data-only ticket files. Parses '### Task N:' sections and creates one ticket per task in in-progress/ready/. Each ticket holds the plan excerpt plus frontmatter (task_number, title, status, plan_path, spec_path, next_prompt, review_failures, task_base_sha). Worker prompts live in the delegate-driven-development skill, not in tickets.",
+    promptSnippet:
+      "Use to convert an implementation plan into data-only executable tickets. Requires a plan with '### Task N: Title' sections.",
+    parameters: Type.Object({
+      plan_path: Type.String({ description: "Path to the implementation plan markdown file" }),
+      spec_path: Type.Optional(
+        Type.String({ description: "Path to the design spec document (for spec review stage)" })
+      ),
+    }),
+
+    async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+      const cwd = ctx?.cwd ?? process.cwd();
+      try {
+        const result = shardPlan(params.plan_path, params.spec_path, cwd);
+        const ticketList = result.tickets
+          .map((t) => `  Task ${t.number}: ${t.title}\n    → ${result.outputDir}/${t.filename}`)
+          .join("\n");
+
+        return {
+          content: [
+            {
+              type: "text",
+              text: `✓ Sharded plan into ${result.ticketsCreated} tickets\n\n${ticketList}\n\nNext: the orchestrator moves the first ticket to active with ticket_move and dispatches an implementer.`,
+            },
+          ],
+          details: result,
+        };
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        return {
+          content: [{ type: "text", text: `Error: ${message}` }],
+          details: { error: message },
+        };
+      }
+    },
+  });
+
+  // Tool: ticket_list
+  pi.registerTool({
+    name: "ticket_list",
+    label: "List Tickets",
+    description:
+      "List tickets by status. Shows ticket counts and titles for each status (ready, active, review, needs-fix, blocked, done).",
+    promptSnippet: "Use to see current ticket status across the workflow.",
+    parameters: Type.Object({
+      status: Type.Optional(
+        Type.Union(STATUSES.map((s) => Type.Literal(s)), {
+          description: "Filter to specific status (default: show all)",
+        })
+      ),
+    }),
+
+    async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+      const cwd = ctx?.cwd ?? process.cwd();
+      try {
+        const result = listTickets(params.status as Status | undefined, cwd);
+
+        const output = result.statuses
+          .map((s) => {
+            const header = `═══ ${s.status} (${s.count}) ═══`;
+            if (s.count === 0) return header;
+            const tickets = s.tickets.map((t) => `  ${t.file}: ${t.title}`).join("\n");
+            return `${header}\n${tickets}`;
+          })
+          .join("\n\n");
+
+        return {
+          content: [{ type: "text", text: `📋 Tickets by status\n\n${output}` }],
+          details: result,
+        };
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        return {
+          content: [{ type: "text", text: `Error: ${message}` }],
+          details: { error: message },
+        };
+      }
+    },
+  });
+
+  // Tool: ticket_show
+  pi.registerTool({
+    name: "ticket_show",
+    label: "Show Ticket",
+    description:
+      "Show detailed information about a ticket including frontmatter fields and document outline.",
+    promptSnippet: "Use to inspect a ticket's metadata, status, and structure.",
+    parameters: Type.Object({
+      ticket: Type.String({
+        description: "Ticket identifier (filename or partial match, e.g. 'task-01' or '01')",
+      }),
+    }),
+
+    async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+      const cwd = ctx?.cwd ?? process.cwd();
+      try {
+        const result = showTicket(params.ticket, cwd);
+
+        const fmLines = Object.entries(result.frontmatter)
+          .map(([k, v]) => {
+            const val = typeof v === "string" && v.includes("\n") ? "(multiline)" : v;
+            return `  ${k}: ${val}`;
+          })
+          .join("\n");
+
+        return {
+          content: [
+            {
+              type: "text",
+              text: `📄 ${result.file}\n\nFrontmatter:\n${fmLines}\n\nOutline:\n${result.outline}`,
+            },
+          ],
+          details: result,
+        };
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        return {
+          content: [{ type: "text", text: `Error: ${message}` }],
+          details: { error: message },
+        };
+      }
+    },
+  });
+
+  // Tool: ticket_move
+  pi.registerTool({
+    name: "ticket_move",
+    label: "Move Ticket",
+    description:
+      "Move a ticket to a different status. Updates the status frontmatter field and moves the file to the corresponding folder.",
+    promptSnippet:
+      "Use to progress tickets through workflow: ready → active → review → done (or needs-fix/blocked).",
+    parameters: Type.Object({
+      ticket: Type.String({
+        description: "Ticket identifier (filename or partial match)",
+      }),
+      status: Type.Union(STATUSES.map((s) => Type.Literal(s)), {
+        description: "Target status to move ticket to",
+      }),
+    }),
+
+    async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+      const cwd = ctx?.cwd ?? process.cwd();
+      try {
+        const result = moveTicket(params.ticket, params.status as Status, cwd);
+
+        return {
+          content: [
+            {
+              type: "text",
+              text: `✓ Moved ${result.file}\n  ${result.fromStatus} → ${result.toStatus}\n  → ${result.newPath}`,
+            },
+          ],
+          details: result,
+        };
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        return {
+          content: [{ type: "text", text: `Error: ${message}` }],
+          details: { error: message },
+        };
+      }
+    },
+  });
+
+  // Tool: ticket_set
+  pi.registerTool({
+    name: "ticket_set",
+    label: "Set Ticket Field",
+    description: "Set a frontmatter field on a ticket. Common fields: next_prompt, status, lane.",
+    promptSnippet: "Use to update ticket metadata, especially next_prompt for workflow handoffs.",
+    parameters: Type.Object({
+      ticket: Type.String({
+        description: "Ticket identifier (filename or partial match)",
+      }),
+      field: Type.String({
+        description: "Frontmatter field name to set",
+      }),
+      value: Type.String({
+        description: "Value to set for the field",
+      }),
+    }),
+
+    async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+      const cwd = ctx?.cwd ?? process.cwd();
+      try {
+        const result = setTicketField(params.ticket, params.field, params.value, cwd);
+
+        return {
+          content: [
+            {
+              type: "text",
+              text: `✓ Set ${result.field} on ${result.file}`,
+            },
+          ],
+          details: result,
+        };
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        return {
+          content: [{ type: "text", text: `Error: ${message}` }],
+          details: { error: message },
+        };
+      }
+    },
+  });
+
+  // Tool: ticket_next
+  pi.registerTool({
+    name: "ticket_next",
+    label: "Get Next Prompt",
+    description:
+      "Get the next_prompt field from a ticket. This contains the instructions for the next agent working on the ticket.",
+    promptSnippet:
+      "Use to retrieve handoff instructions from a ticket before starting work or review.",
+    parameters: Type.Object({
+      ticket: Type.String({
+        description: "Ticket identifier (filename or partial match)",
+      }),
+    }),
+
+    async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+      const cwd = ctx?.cwd ?? process.cwd();
+      try {
+        const result = getNextPrompt(params.ticket, cwd);
+
+        return {
+          content: [
+            {
+              type: "text",
+              text: `📋 Next prompt for ${result.file}:\n\n---\n${result.next_prompt}\n---`,
+            },
+          ],
+          details: result,
+        };
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        return {
+          content: [{ type: "text", text: `Error: ${message}` }],
+          details: { error: message },
+        };
+      }
+    },
+  });
+
+  // Tool: ticket_get
+  pi.registerTool({
+    name: "ticket_get",
+    label: "Get Ticket Field",
+    description:
+      "Read a single frontmatter field from a ticket (e.g. review_failures, task_base_sha, status, title). Returns the raw value.",
+    promptSnippet:
+      "Use to read back a ticket frontmatter field, e.g. the review_failures counter or task_base_sha diff boundary.",
+    parameters: Type.Object({
+      ticket: Type.String({
+        description: "Ticket identifier (filename or partial match)",
+      }),
+      field: Type.String({
+        description: "Frontmatter field name to read",
+      }),
+    }),
+
+    async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+      const cwd = ctx?.cwd ?? process.cwd();
+      try {
+        const result = getTicketField(params.ticket, params.field, cwd);
+        return {
+          content: [
+            {
+              type: "text",
+              text: `${result.field} on ${result.file}: ${result.value === "" ? "(empty)" : result.value}`,
+            },
+          ],
+          details: result,
+        };
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        return {
+          content: [{ type: "text", text: `Error: ${message}` }],
+          details: { error: message },
+        };
+      }
+    },
+  });
+}
